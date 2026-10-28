@@ -6,8 +6,9 @@
 // window is taken back to its first page if it reopened on an inner one
 // (a password's details, say); a recent run leaves it where it was. While the
 // window stays open, ⌘1…⌘9 open that row of the list on show, Return in the
-// search field opens the first, on a password's page ⌘1/⌘2 copy the user name
-// and password and hide the window, and Esc goes back a page.
+// search field opens the first, on a password's page ⌘1/⌘2/⌘3 copy the user
+// name, password and verification code and hide the window, and Esc goes back
+// a page.
 //
 // Build: ./build.sh (open-passwords-menu.sh, one level up, runs the result)
 // Needs Accessibility access for whatever runs it (Raycast).
@@ -202,12 +203,14 @@ func visibleRows(in window: AXUIElement) -> [CGRect] {
         .sorted { $0.minY < $1.minY }
 }
 
-/// On a password's page: where its user name and password are shown, in that
-/// order. Clicking either copies it. Each row is a label on the left and its
+/// On a password's page: where its user name, password and verification code
+/// are shown, in that order (nil where the page has none). Clicking one copies
+/// it. Each row is a label on the left and its
 /// value against the right edge; only the labels' text is looked at.
 func detailFields(in window: AXUIElement) -> [CGRect?] {
     let userNames: Set<String> = ["用户名", "User Name", "Username", "使用者名稱"]
     let passwords: Set<String> = ["密码", "Password", "密碼"]
+    let codes: Set<String> = ["验证码", "Verification Code", "驗證碼"]
     func frame(_ element: AXUIElement) -> CGRect? {
         guard let origin = point(element, kAXPositionAttribute), let size = size(element) else { return nil }
         return CGRect(origin: origin, size: size)
@@ -215,7 +218,7 @@ func detailFields(in window: AXUIElement) -> [CGRect?] {
     guard let content = children(window).first.flatMap({ group in
               children(group).first { attribute($0, kAXRoleAttribute) as? String == kAXScrollAreaRole as String }
           }).flatMap({ children($0).first }),
-          let bounds = frame(content) else { return [nil, nil] }
+          let bounds = frame(content) else { return [nil, nil, nil] }
     let texts = children(content).filter { attribute($0, kAXRoleAttribute) as? String == kAXStaticTextRole as String }
         .compactMap { element in frame(element).map { (element, $0) } }
     let labels = texts.filter { $0.1.minX < bounds.minX + 20 }
@@ -224,17 +227,19 @@ func detailFields(in window: AXUIElement) -> [CGRect?] {
         guard let label = labels.first(where: { names.contains(attribute($0.0, kAXValueAttribute) as? String ?? "") }) else { return nil }
         return values.first { abs($0.midY - label.1.midY) < 6 }
     }
-    let named = [value(labelled: userNames), value(labelled: passwords)]
-    // Labels in an unexpected language: the first two rows are user name and password.
+    let named = [value(labelled: userNames), value(labelled: passwords), value(labelled: codes)]
+    // Labels in an unexpected language: the first two rows are user name and
+    // password. (No guess for the code: the third row is often the website.)
     guard named.allSatisfy({ $0 == nil }) else { return named }
     let ordered = values.sorted { $0.minY < $1.minY }
-    return [ordered.first, ordered.dropFirst().first]
+    return [ordered.first, ordered.dropFirst().first, nil]
 }
 
 /// Runs while the window is open (Raycast starts it detached, see `startKeyWatcher`):
 /// ⌘1…⌘9 click that row of the list, the same as clicking it (Return in the
-/// search field clicks the first); on a password's page ⌘1 and ⌘2 copy its
-/// user name and password, by clicking them, and hide the window. Esc on an
+/// search field clicks the first); on a password's page ⌘1, ⌘2 and ⌘3 copy its
+/// user name, password and verification code, by clicking them, and hide the
+/// window. Esc on an
 /// inner page goes back one page (on the first page it is left to close the
 /// window, as usual). Other keys pass through untouched, and nothing typed is
 /// read or kept.
@@ -291,7 +296,7 @@ func watchKeys(_ app: AXUIElement) -> Never {
             let fields = rows.isEmpty ? detailFields(in: window) : []
             if index < rows.count {
                 click(at: CGPoint(x: rows[index].midX, y: rows[index].midY))
-            } else if index < 2, let field = fields[index] {
+            } else if index < fields.count, let field = fields[index] {
                 // Copied: hide the window (it reopens on this page) so the
                 // field being filled in is back in front.
                 // The window handles the clicks in order, so the copy is done
