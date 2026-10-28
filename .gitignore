@@ -1,0 +1,4 @@
+.DS_Store
+# Compiled helpers: rebuild with each tool's build.sh.
+passwords-menu/open-passwords-menu
+*.bak
