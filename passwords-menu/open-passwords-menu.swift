@@ -5,8 +5,11 @@
 // the user binds to "Activate the extension" for iCloud Passwords — then
 // stops. It does not also click the toolbar button (that button toggles) or
 // the Passwords menu bar in the same run. A pairing PIN is left alone, and
-// the picker is left to the extension's own keys. Accessibility often misses
-// the extension popup, so a missed popup is not a reason to open the menu bar.
+// the picker's own keys fill a credential. Once that list is on screen, one
+// ArrowDown highlights the first row (the extension does that when nothing is
+// active). Enter is left to the user. A pairing PIN page gets no ArrowDown,
+// Enter, or digits. Accessibility often misses the popup, so a missed popup
+// is not a reason to open the menu bar.
 //
 // Otherwise it clicks the Passwords menu bar icon
 // (com.apple.Passwords.MenuBarExtra) where Accessibility reports it and puts
@@ -46,7 +49,8 @@ func fail(_ message: String) -> Never {
 }
 
 /// `--trace` prints control flow only: bundle id, and whether we activated,
-/// sent the shortcut, thought a popup appeared, or clicked the toolbar or menu bar.
+/// sent the shortcut, thought a popup appeared, saw a PIN page, sent ArrowDown,
+/// or clicked the toolbar or menu bar. Never window contents.
 var traceEnabled = false
 
 func trace(_ fact: String) {
@@ -371,12 +375,10 @@ let iCloudPasswordsExtensionID = "pejdijmoenmkgeppbflobdenhhabjlaj"
 /// The user binds it in Ardia; this script only sends it.
 let extensionShortcutKeyCode: CGKeyCode = 0x2A
 
-/// How long to wait for the extension popup after the shortcut or the toolbar click.
-let extensionPopupTimeout: TimeInterval = 0.8
-
 /// Popup titles. A window matches when its title is one of these, or that
 /// name plus a separator. Accounts, passwords, codes, and list rows are not read.
 let extensionPopupTitles: Set<String> = [
+    "Password Manager",
     "iCloud Passwords",
     "iCloud 密码",
     "iCloud 密碼",
@@ -414,7 +416,7 @@ func windowTitle(_ window: AXUIElement) -> String {
 
 func isPopupSized(_ window: AXUIElement) -> Bool {
     guard isPopupRole(window), let frame = size(window) else { return false }
-    return frame.width >= 140 && frame.width <= 520 && frame.height >= 80 && frame.height <= 720
+    return isPopupFrame(frame)
 }
 
 func titleMatchesExtension(_ title: String) -> Bool {
@@ -466,18 +468,24 @@ func isPINToken(_ token: String) -> Bool {
     return digits == 6
 }
 
-/// The pairing screen shows a 6-digit PIN (one text, or six single digits).
-/// Lists are not walked, so account rows are never read. The digits are only
-/// tested as a pattern and are not stored or logged.
+/// The pairing screen shows a 6-digit PIN (one text, six single digits, or
+/// fields named PIN0…PIN5). Lists are not walked, so account rows are never
+/// read. Digits are only tested as a pattern and are not stored or logged.
 func isPairingPINPage(_ window: AXUIElement) -> Bool {
     var sixDigitText = false
     var singleDigits = 0
+    var pinFields = 0
     func walk(_ element: AXUIElement, depth: Int) {
-        if sixDigitText || singleDigits >= 6 || depth > 9 { return }
+        if sixDigitText || singleDigits >= 6 || pinFields >= 6 || depth > 12 { return }
         let role = attribute(element, kAXRoleAttribute) as? String ?? ""
         if role == kAXListRole as String || role == kAXOutlineRole as String
             || role == kAXTableRole as String || role == kAXRowRole as String {
             return
+        }
+        let ident = (attribute(element, "AXDOMIdentifier") as? String)
+            ?? (attribute(element, kAXIdentifierAttribute) as? String) ?? ""
+        if ident.hasPrefix("PIN"), ident.count > 3, ident.dropFirst(3).allSatisfy({ $0.isASCII && $0.isNumber }) {
+            pinFields += 1
         }
         if role == kAXStaticTextRole as String, let raw = attribute(element, kAXValueAttribute) as? String {
             let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -495,14 +503,154 @@ func isPairingPINPage(_ window: AXUIElement) -> Bool {
         for child in children(element) { walk(child, depth: depth + 1) }
     }
     walk(window, depth: 0)
-    return sixDigitText || singleDigits >= 6
+    return sixDigitText || singleDigits >= 6 || pinFields >= 6
 }
 
-/// Popup is open. Phase 1 stops: a pairing PIN is left for the user (no
-/// Return, no chosen item), and the picker is left to the extension's own
-/// Up/Down/Enter. Menu-bar shortcuts are not replayed here.
-func leaveExtensionPopup(_ popup: AXUIElement) {
-    if isPairingPINPage(popup) { return }
+func isPopupFrame(_ frame: CGSize) -> Bool {
+    frame.width >= 140 && frame.width <= 520 && frame.height >= 80 && frame.height <= 720
+}
+
+func windowIDs(ownedBy pid: pid_t) -> Set<CGWindowID> {
+    guard let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [NSDictionary] else {
+        return []
+    }
+    var ids: Set<CGWindowID> = []
+    for info in raw {
+        let owner = pid_t((info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value ?? -1)
+        guard owner == pid else { continue }
+        ids.insert(CGWindowID((info[kCGWindowNumber as String] as? NSNumber)?.uint32Value ?? 0))
+    }
+    return ids
+}
+
+struct OwnedWindow {
+    let id: CGWindowID
+    let title: String
+}
+
+/// A new popup-sized window of `pid`. Accessibility often misses this popup;
+/// the window list still shows it. Titles are not logged.
+func newPopupWindow(ownedBy pid: pid_t, newSince previous: Set<CGWindowID>) -> OwnedWindow? {
+    guard let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [NSDictionary] else {
+        return nil
+    }
+    var fresh: [OwnedWindow] = []
+    for info in raw {
+        let owner = pid_t((info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value ?? -1)
+        let id = CGWindowID((info[kCGWindowNumber as String] as? NSNumber)?.uint32Value ?? 0)
+        guard owner == pid, !previous.contains(id) else { continue }
+        let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
+        if layer < 0 { continue }
+        guard let boundsInfo = info[kCGWindowBounds as String] as? NSDictionary else { continue }
+        var bounds = CGRect.zero
+        guard CGRectMakeWithDictionaryRepresentation(boundsInfo, &bounds), isPopupFrame(bounds.size) else { continue }
+        let title = (info[kCGWindowName as String] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        fresh.append(OwnedWindow(id: id, title: title))
+    }
+    if let named = fresh.first(where: { titleMatchesExtension($0.title) }) { return named }
+    if fresh.count == 1, let only = fresh.first, only.title.isEmpty || titleMatchesExtension(only.title) {
+        return only
+    }
+    return nil
+}
+
+func showsPINPage(_ app: AXUIElement) -> Bool {
+    axWindows(app).contains { isPopupSized($0) && isPairingPINPage($0) }
+}
+
+/// A row exists. Its label is not read.
+func listHasRow(_ window: AXUIElement) -> Bool {
+    func walk(_ element: AXUIElement, depth: Int) -> Bool {
+        if depth > 10 { return false }
+        let role = attribute(element, kAXRoleAttribute) as? String ?? ""
+        if role == kAXListRole as String || role == kAXOutlineRole as String || role == kAXTableRole as String {
+            let rows = attribute(element, kAXRowsAttribute) as? [AXUIElement] ?? []
+            if !rows.isEmpty || children(element).contains(where: {
+                (attribute($0, kAXRoleAttribute) as? String) == kAXRowRole as String
+            }) { return true }
+        }
+        for child in children(element) {
+            if walk(child, depth: depth + 1) { return true }
+        }
+        return false
+    }
+    return walk(window, depth: 0)
+}
+
+/// Down arrow (`kVK_DownArrow`). No modifiers: this is not the open shortcut.
+/// The extension highlights the first row when nothing is active yet.
+func pressArrowDown() {
+    let source = CGEventSource(stateID: .hidSystemState)
+    for down in [true, false] {
+        let event = CGEvent(keyboardEventSource: source, virtualKey: 0x7D, keyDown: down)
+        event?.flags = []
+        event?.post(tap: .cghidEventTap)
+        usleep(8_000)
+    }
+}
+
+func frontIs(_ application: NSRunningApplication) -> Bool {
+    NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier
+}
+
+/// Highlight the first credential, once, after the picker list is up.
+/// No Enter. No ArrowDown on the pairing PIN page, and none at all if no
+/// popup window appeared (that would hit the page underneath).
+func highlightFirstCredential(in application: NSRunningApplication, browser: AXUIElement, previousAX: [AXUIElement], previousWindowIDs: Set<CGWindowID>) {
+    let deadline = Date().addingTimeInterval(1.4)
+    var seenAt: Date?
+    while Date() < deadline {
+        let ax = appearedExtensionPopup(of: browser, since: previousAX)
+        if let ax, isPairingPINPage(ax) {
+            trace("popup true")
+            trace("pin true")
+            trace("arrow-down false")
+            return
+        }
+        if showsPINPage(browser) {
+            trace("popup true")
+            trace("pin true")
+            trace("arrow-down false")
+            return
+        }
+        let visible = newPopupWindow(ownedBy: application.processIdentifier, newSince: previousWindowIDs) != nil || ax != nil
+        if visible, seenAt == nil { seenAt = Date() }
+        let age = seenAt.map { Date().timeIntervalSince($0) } ?? 0
+        // ArrowDown before the list exists does nothing. A row is the ready
+        // signal; without one, wait until the popup has had time to render.
+        if age >= 0.35, let ax, listHasRow(ax) { break }
+        if age >= 0.7, ax == nil, visible { break }
+        if age >= 0.9, ax != nil { break }
+        usleep(20_000)
+    }
+    let pin = showsPINPage(browser)
+    let popup = appearedExtensionPopup(of: browser, since: previousAX)
+    let stillThere = popup != nil
+        || newPopupWindow(ownedBy: application.processIdentifier, newSince: previousWindowIDs) != nil
+    trace("popup \(stillThere)")
+    guard seenAt != nil, !pin, stillThere else {
+        trace("pin \(pin)")
+        trace("arrow-down false")
+        return
+    }
+    if let popup, isPairingPINPage(popup) {
+        trace("pin true")
+        trace("arrow-down false")
+        return
+    }
+    if !frontIs(application) {
+        if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != application.processIdentifier {
+            _ = application.activate(from: front)
+        }
+        guard waitFor(0.3, { frontIs(application) ? true : nil }) != nil else {
+            trace("pin false")
+            trace("arrow-down false")
+            return
+        }
+    }
+    pressArrowDown()
+    trace("pin false")
+    trace("arrow-down true")
 }
 
 /// Sends ⌘⇧\ to Ardia and returns. This run does not click the toolbar or the
@@ -520,13 +668,12 @@ func openICloudPasswordsExtension(_ application: NSRunningApplication) {
     _ = waitFor(0.3) { application.isActive ? true : nil }
     trace("activated \(activated)")
     let browser = AXUIElementCreateApplication(application.processIdentifier)
-    AXUIElementSetMessagingTimeout(browser, 0.4)
+    AXUIElementSetMessagingTimeout(browser, 0.3)
     let beforeShortcut = axWindows(browser)
+    let beforeWindows = windowIDs(ownedBy: application.processIdentifier)
     sendCommandShiftBackslash()
     trace("sent-keys true")
-    let popup = waitFor(extensionPopupTimeout, { appearedExtensionPopup(of: browser, since: beforeShortcut) })
-    trace("popup \(popup != nil)")
-    if let popup { leaveExtensionPopup(popup) }
+    highlightFirstCredential(in: application, browser: browser, previousAX: beforeShortcut, previousWindowIDs: beforeWindows)
     trace("toolbar false")
     trace("menu-bar false")
 }
