@@ -234,7 +234,9 @@ func firefoxAddress(pid: pid_t) -> String? {
         for child in children(element) { if let found = find(child, depth: depth + 1) { return found } }
         return nil
     }
-    guard let window = attribute(app, kAXFocusedWindowAttribute) as? AXUIElement else { return nil }
+    guard let window = attribute(app, kAXFocusedWindowAttribute).flatMap({
+        CFGetTypeID($0) == AXUIElementGetTypeID() ? ($0 as! AXUIElement) : nil
+    }) else { return nil }
     return find(window)
 }
 
@@ -380,7 +382,7 @@ func sendCommandShiftBackslash() {
 
 func isPopupRole(_ window: AXUIElement) -> Bool {
     let role = attribute(window, kAXRoleAttribute) as? String ?? ""
-    return role == kAXWindowRole as String || role == kAXSheetRole as String || role == kAXDialogRole as String
+    return role == kAXWindowRole as String || role == kAXSheetRole as String || role == "AXDialog"
 }
 
 func windowTitle(_ window: AXUIElement) -> String {
@@ -460,7 +462,7 @@ func extensionButtons(in element: AXUIElement, depth: Int = 0, limit: Int) -> [A
         }
         for child in children(element) { walk(child, depth: depth + 1) }
     }
-    walk(element, depth)
+    walk(element, depth: depth)
     return matches
 }
 
@@ -481,7 +483,9 @@ func clickElement(_ element: AXUIElement) {
 }
 
 func frontWindow(_ app: AXUIElement) -> AXUIElement? {
-    if let focused = attribute(app, kAXFocusedWindowAttribute) as? AXUIElement { return focused }
+    if let focused = attribute(app, kAXFocusedWindowAttribute).flatMap({
+        CFGetTypeID($0) == AXUIElementGetTypeID() ? ($0 as! AXUIElement) : nil
+    }) { return focused }
     return axWindows(app).first
 }
 
@@ -529,7 +533,7 @@ func isPairingPINPage(_ window: AXUIElement) -> Bool {
         }
         for child in children(element) { walk(child, depth: depth + 1) }
     }
-    walk(window, 0)
+    walk(window, depth: 0)
     return sixDigitText || singleDigits >= 6
 }
 
