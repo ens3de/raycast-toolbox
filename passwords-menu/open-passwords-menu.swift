@@ -1,12 +1,12 @@
 // open-passwords-menu — opens the Passwords menu bar window.
 //
-// Run from Raycast ("打开密码菜单"). When the front app is Ardia, it first
-// sends ⌘⇧\ (Command, Shift, and the backslash key) — the shortcut the user
-// binds to "Activate the extension" for iCloud Passwords. If that popup
-// appears, it stops: a pairing PIN is left alone, and the picker is left to
-// the extension's own keys. If the popup does not appear, it clicks a pinned
-// toolbar button when exactly one can be found. If that also fails, it uses
-// the menu bar.
+// Run from Raycast ("打开密码菜单"). When the front app is Ardia, it activates
+// Ardia and sends ⌘⇧\ (Command, Shift, and the backslash key) — the shortcut
+// the user binds to "Activate the extension" for iCloud Passwords — then
+// stops. It does not also click the toolbar button (that button toggles) or
+// the Passwords menu bar in the same run. A pairing PIN is left alone, and
+// the picker is left to the extension's own keys. Accessibility often misses
+// the extension popup, so a missed popup is not a reason to open the menu bar.
 //
 // Otherwise it clicks the Passwords menu bar icon
 // (com.apple.Passwords.MenuBarExtra) where Accessibility reports it and puts
@@ -19,10 +19,11 @@
 // a page. Those shortcuts stay on the menu bar window; they are not sent to
 // the extension popup.
 //
-// When the front app is a browser, the menu bar window opens on its first page
-// with the current site's domain typed into the search field, and Return opens
-// the first match. Safari and Chromium browsers (including Ardia) are asked
-// through AppleScript, Firefox through its address bar.
+// When the front app is another browser, the menu bar window opens on its first
+// page with the current site's domain typed into the search field, and Return
+// opens the first match. Safari and Chromium browsers are asked through
+// AppleScript, Firefox through its address bar. Ardia is one of those browsers
+// for `--domain`, but a normal run with Ardia in front never reaches the menu.
 //
 // Build: ./build.sh (open-passwords-menu.sh, one level up, runs the result)
 // Needs Accessibility access for whatever runs it (Raycast).
@@ -42,6 +43,15 @@ let lastRunURL = FileManager.default.homeDirectoryForCurrentUser
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data((message + "\n").utf8))
     exit(1)
+}
+
+/// `--trace` prints control flow only: bundle id, and whether we activated,
+/// sent the shortcut, thought a popup appeared, or clicked the toolbar or menu bar.
+var traceEnabled = false
+
+func trace(_ fact: String) {
+    guard traceEnabled else { return }
+    FileHandle.standardError.write(Data(("open-passwords-menu: " + fact + "\n").utf8))
 }
 
 // MARK: - Accessibility helpers
@@ -269,13 +279,25 @@ func isLocalOrPrivateHost(_ host: String) -> Bool {
         || (a == 192 && b == 168)
 }
 
-/// The front app, once Raycast (which just launched this) has stepped aside.
+/// Launchers that start this command. They are not the app the command acts on.
+let launcherBundleIDs: Set<String> = [
+    "com.raycast.macos",
+    "com.apple.Spotlight",
+    "com.runningwithcrayons.Alfred",
+]
+
+func isLauncher(_ id: String?) -> Bool {
+    guard let id else { return false }
+    return launcherBundleIDs.contains(id)
+}
+
+/// The front app, once a launcher that just started this has stepped aside.
+/// A launcher is never the target, even if it is still front when the wait ends.
 func frontApplication() -> NSRunningApplication? {
-    let raycast = "com.raycast.macos"
-    return waitFor(0.5) { () -> NSRunningApplication? in
+    waitFor(0.6) { () -> NSRunningApplication? in
         let app = NSWorkspace.shared.frontmostApplication
-        return app?.bundleIdentifier == raycast ? nil : app
-    } ?? NSWorkspace.shared.frontmostApplication
+        return isLauncher(app?.bundleIdentifier) ? nil : app
+    }
 }
 
 /// The current page's address in `application`, when it is a browser we know.
@@ -428,67 +450,6 @@ func appearedExtensionPopup(of app: AXUIElement, since before: [AXUIElement]) ->
     return only
 }
 
-func isPasswordsExtensionButton(_ element: AXUIElement) -> Bool {
-    if let identifier = attribute(element, kAXIdentifierAttribute) as? String,
-       identifier.contains(iCloudPasswordsExtensionID) {
-        return true
-    }
-    let values = attributes(element, [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute])
-    for case let raw as String in values {
-        let line = String(raw.prefix { !$0.isNewline }).trimmingCharacters(in: .whitespacesAndNewlines)
-        if extensionPopupTitles.contains(line) { return true }
-    }
-    return false
-}
-
-func findElement(_ element: AXUIElement, role: String, depth: Int = 0, limit: Int) -> AXUIElement? {
-    if attribute(element, kAXRoleAttribute) as? String == role { return element }
-    guard depth < limit else { return nil }
-    for child in children(element) {
-        if let found = findElement(child, role: role, depth: depth + 1, limit: limit) { return found }
-    }
-    return nil
-}
-
-/// Buttons whose name is the extension. A second match makes the result
-/// ambiguous, and the walk stops.
-func extensionButtons(in element: AXUIElement, depth: Int = 0, limit: Int) -> [AXUIElement] {
-    var matches: [AXUIElement] = []
-    func walk(_ element: AXUIElement, depth: Int) {
-        if matches.count > 1 || depth > limit { return }
-        let role = attribute(element, kAXRoleAttribute) as? String ?? ""
-        if role == kAXButtonRole as String || role == kAXPopUpButtonRole as String || role == kAXMenuButtonRole as String {
-            if isPasswordsExtensionButton(element) { matches.append(element) }
-        }
-        for child in children(element) { walk(child, depth: depth + 1) }
-    }
-    walk(element, depth: depth)
-    return matches
-}
-
-/// The pinned iCloud Passwords toolbar button, only when the toolbar has exactly one.
-/// No toolbar, or more than one match: nothing to click.
-func pinnedPasswordsButton(in window: AXUIElement) -> AXUIElement? {
-    guard let toolbar = findElement(window, role: kAXToolbarRole as String, limit: 6) else { return nil }
-    let matches = extensionButtons(in: toolbar, limit: 8)
-    return matches.count == 1 ? matches[0] : nil
-}
-
-func clickElement(_ element: AXUIElement) {
-    if let origin = point(element, kAXPositionAttribute), let frame = size(element), frame.width > 0, frame.height > 0 {
-        click(at: CGPoint(x: origin.x + frame.width / 2, y: origin.y + frame.height / 2))
-    } else {
-        AXUIElementPerformAction(element, kAXPressAction as CFString)
-    }
-}
-
-func frontWindow(_ app: AXUIElement) -> AXUIElement? {
-    if let focused = attribute(app, kAXFocusedWindowAttribute).flatMap({
-        CFGetTypeID($0) == AXUIElementGetTypeID() ? ($0 as! AXUIElement) : nil
-    }) { return focused }
-    return axWindows(app).first
-}
-
 /// "123456", "123 456", or "123-456". The characters are not kept.
 func isPINToken(_ token: String) -> Bool {
     guard !token.isEmpty, token.count <= 8 else { return false }
@@ -544,31 +505,30 @@ func leaveExtensionPopup(_ popup: AXUIElement) {
     if isPairingPINPage(popup) { return }
 }
 
-/// Opens the iCloud Passwords popup in Ardia. False means use the menu bar.
-func openICloudPasswordsExtension(_ application: NSRunningApplication) -> Bool {
-    // macOS 14 and later only honors activation that names the app in front.
+/// Sends ⌘⇧\ to Ardia and returns. This run does not click the toolbar or the
+/// Passwords menu bar afterwards. The shortcut already opens the extension;
+/// the toolbar button toggles, so a click in the same run closes it again.
+/// Whether Accessibility sees the popup does not matter: a miss used to fall
+/// through and open the system Passwords window on top (the lock dialog).
+func openICloudPasswordsExtension(_ application: NSRunningApplication) {
+    var activated = false
     if !application.isActive, let front = NSWorkspace.shared.frontmostApplication,
        front.processIdentifier != application.processIdentifier {
         _ = application.activate(from: front)
-        _ = waitFor(0.3) { application.isActive ? true : nil }
+        activated = true
     }
+    _ = waitFor(0.3) { application.isActive ? true : nil }
+    trace("activated \(activated)")
     let browser = AXUIElementCreateApplication(application.processIdentifier)
     AXUIElementSetMessagingTimeout(browser, 0.4)
     let beforeShortcut = axWindows(browser)
     sendCommandShiftBackslash()
-    if let popup = waitFor(extensionPopupTimeout, { appearedExtensionPopup(of: browser, since: beforeShortcut) }) {
-        leaveExtensionPopup(popup)
-        return true
-    }
-    if let window = frontWindow(browser), let button = pinnedPasswordsButton(in: window) {
-        let beforeClick = axWindows(browser)
-        clickElement(button)
-        if let popup = waitFor(extensionPopupTimeout, { appearedExtensionPopup(of: browser, since: beforeClick) }) {
-            leaveExtensionPopup(popup)
-            return true
-        }
-    }
-    return false
+    trace("sent-keys true")
+    let popup = waitFor(extensionPopupTimeout, { appearedExtensionPopup(of: browser, since: beforeShortcut) })
+    trace("popup \(popup != nil)")
+    if let popup { leaveExtensionPopup(popup) }
+    trace("toolbar false")
+    trace("menu-bar false")
 }
 
 // MARK: - Keys while the window is open
@@ -744,7 +704,9 @@ func startKeyWatcher() {
 
 guard AXIsProcessTrusted() else { fail("Accessibility access is needed (System Settings → Privacy & Security → Accessibility).") }
 
-let command = CommandLine.arguments.dropFirst().first
+let args = Array(CommandLine.arguments.dropFirst())
+traceEnabled = args.contains("--trace")
+let command = args.first { $0 != "--trace" }
 if command == "--domain" {
     print(frontBrowserDomain() ?? "(none)")
     exit(0)
@@ -759,10 +721,10 @@ if command == "--keys" {
 }
 
 let front = frontApplication()
-// Ardia: the extension popup first. The menu bar, including this tab's domain,
-// runs only when that popup never appears. The menu bar app is not required
-// for the extension itself.
-if let front, front.bundleIdentifier == ardiaBundleID, openICloudPasswordsExtension(front) {
+trace("front \(front?.bundleIdentifier ?? "(none)")")
+// Ardia: the shortcut, then stop. Never the menu bar in this same run.
+if let front, front.bundleIdentifier == ardiaBundleID {
+    openICloudPasswordsExtension(front)
     exit(0)
 }
 
@@ -776,6 +738,8 @@ let siteDomain = front.flatMap { browserAddress(of: $0) }.flatMap(domain(fromAdd
 guard let icon = menuBarIcon(app) else { fail("The Passwords menu bar icon was not found.") }
 // With the window already open, the click closes it and there is nothing more to do.
 let wasOpen = !((attribute(app, kAXWindowsAttribute) as? [AXUIElement]) ?? []).isEmpty
+trace("toolbar false")
+trace("menu-bar true")
 click(at: icon)
 guard !wasOpen, let window = waitFor(1.5, { (attribute(app, kAXWindowsAttribute) as? [AXUIElement])?.first }) else { exit(0) }
 startKeyWatcher()
