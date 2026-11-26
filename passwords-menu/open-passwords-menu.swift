@@ -4,13 +4,14 @@
 // Ardia and sends ⌘⇧\ (Command, Shift, and the backslash key) — the shortcut
 // the user binds to "Activate the extension" for iCloud Passwords — then
 // stops. It does not also click the toolbar button (that button toggles) or
-// the Passwords menu bar in the same run. A detached watcher stays only while
-// that popup window is open. Unmodified Enter, before any Up or Down, is
-// turned into ArrowDown and then Enter: with nothing highlighted the
-// extension would otherwise close, and ArrowDown highlights the first row so
-// the following Enter fills it. After Up or Down, Enter is not touched and
-// fills the highlighted row. A pairing PIN page is not intercepted and is not
-// sent ArrowDown or digits. Nothing in the list is read.
+// the Passwords menu bar in the same run. A detached watcher then handles the
+// picker. When Accessibility can see exactly one credential row, and it is
+// not the pairing PIN page, that row is activated once (the extension fills
+// it). Otherwise unmodified Enter fills the first row, unless Up or Down was
+// already used, in which case Enter is left alone and fills the highlighted
+// row. The picker is often not a new window of Ardia's own process, so Enter
+// is not gated on that. A pairing PIN page is not clicked and is not sent
+// keys. Row text is never read.
 //
 // Otherwise it clicks the Passwords menu bar icon
 // (com.apple.Passwords.MenuBarExtra) where Accessibility reports it and puts
@@ -34,6 +35,7 @@
 
 import AppKit
 import ApplicationServices
+import Darwin
 
 let bundleID = "com.apple.Passwords.MenuBarExtra"
 
@@ -51,8 +53,8 @@ func fail(_ message: String) -> Never {
 
 /// `--trace` prints control flow only: bundle id, and whether we activated,
 /// sent the shortcut, started the popup watcher, or clicked the toolbar or
-/// menu bar. Never window contents. The watcher itself only adds a line when
-/// its own stderr is still open (a spawned watcher has none).
+/// menu bar. Never window contents, titles, or row text. The watcher itself
+/// only adds a line when its own stderr is still open (a spawned watcher has none).
 var traceEnabled = false
 
 func trace(_ fact: String) {
@@ -490,7 +492,7 @@ func isPopupFrame(_ frame: CGSize) -> Bool {
 /// look like "no popup", which skipped the key that should have reached it.
 /// Names are not logged.
 func onScreenWindows() -> [NSDictionary] {
-    guard let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) else {
+    guard let raw = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) else {
         return []
     }
     var windows: [NSDictionary] = []
@@ -505,54 +507,131 @@ func windowNumber(_ info: NSDictionary, _ key: CFString) -> NSNumber? {
     info.object(forKey: key) as? NSNumber
 }
 
-func windowIDs(ownedBy pid: pid_t) -> Set<CGWindowID> {
-    var ids: Set<CGWindowID> = []
-    for info in onScreenWindows() {
-        let owner = pid_t(windowNumber(info, kCGWindowOwnerPID)?.int32Value ?? -1)
-        let id = CGWindowID(windowNumber(info, kCGWindowNumber)?.uint32Value ?? 0)
-        guard owner == pid, id != 0 else { continue }
-        ids.insert(id)
-    }
-    return ids
+func axElement(_ value: AnyObject?) -> AXUIElement? {
+    guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+    return (value as! AXUIElement)
 }
 
-struct OwnedWindow {
+func elementIdentifier(_ element: AXUIElement) -> String {
+    (attribute(element, "AXDOMIdentifier") as? String)
+        ?? (attribute(element, kAXIdentifierAttribute) as? String) ?? ""
+}
+
+func elementFrame(_ element: AXUIElement) -> CGRect? {
+    guard let origin = point(element, kAXPositionAttribute), let frame = size(element) else { return nil }
+    return CGRect(origin: origin, size: frame)
+}
+
+func elementRole(_ element: AXUIElement) -> String {
+    attribute(element, kAXRoleAttribute) as? String ?? ""
+}
+
+/// Parent pid, when libproc can see it. Renderer windows are often not owned
+/// by the browser pid itself. A miss just means that owner is not related.
+func parentProcessID(_ pid: pid_t) -> pid_t? {
+    var info = proc_bsdinfo()
+    let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+    guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+    return pid_t(info.pbi_ppid)
+}
+
+func isRelatedOwner(_ info: NSDictionary, browser: pid_t) -> Bool {
+    let owner = pid_t(windowNumber(info, kCGWindowOwnerPID)?.int32Value ?? -1)
+    guard owner > 0 else { return false }
+    if owner == browser || parentProcessID(owner) == browser { return true }
+    if let bundle = NSRunningApplication(processIdentifier: owner)?.bundleIdentifier,
+       bundle == ardiaBundleID || bundle.hasPrefix("com.ardia.") {
+        return true
+    }
+    guard let browserName = NSRunningApplication(processIdentifier: browser)?.localizedName,
+          let ownerName = info.object(forKey: kCGWindowOwnerName) as? String else { return false }
+    return ownerName == browserName || ownerName.hasPrefix(browserName + " ")
+}
+
+struct SeenWindow {
     let id: CGWindowID
-    let title: String
+    let width: Int
+    let height: Int
+    let titleMatches: Bool
     let popupSized: Bool
 }
 
-/// A new popup-sized window of `pid`. Accessibility often misses this popup;
-/// the window list still shows it. Titles are not logged.
-func newPopupWindow(ownedBy pid: pid_t, newSince previous: Set<CGWindowID>) -> OwnedWindow? {
-    var fresh: [OwnedWindow] = []
+func seenWindows(of browser: pid_t) -> [SeenWindow] {
+    var windows: [SeenWindow] = []
     for info in onScreenWindows() {
-        let owner = pid_t(windowNumber(info, kCGWindowOwnerPID)?.int32Value ?? -1)
+        guard isRelatedOwner(info, browser: browser) else { continue }
         let id = CGWindowID(windowNumber(info, kCGWindowNumber)?.uint32Value ?? 0)
-        guard owner == pid, id != 0, !previous.contains(id) else { continue }
         let layer = windowNumber(info, kCGWindowLayer)?.intValue ?? 0
-        if layer < 0 { continue }
-        let title = (info.object(forKey: kCGWindowName) as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        var popupSized = false
+        guard id != 0, layer >= 0 else { continue }
+        var width = 0
+        var height = 0
         if let boundsInfo = info.object(forKey: kCGWindowBounds) as? NSDictionary {
             var bounds = CGRect.zero
-            if CGRectMakeWithDictionaryRepresentation(boundsInfo, &bounds),
-               bounds.width > 1, bounds.height > 1 {
-                // A known large window (the browser itself) is not the popup.
-                guard isPopupFrame(bounds.size) else { continue }
-                popupSized = true
+            if CGRectMakeWithDictionaryRepresentation(boundsInfo, &bounds) {
+                width = Int(bounds.width.rounded())
+                height = Int(bounds.height.rounded())
             }
         }
-        fresh.append(OwnedWindow(id: id, title: title, popupSized: popupSized))
+        let title = (info.object(forKey: kCGWindowName) as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let popupSized = isPopupFrame(CGSize(width: width, height: height))
+        windows.append(SeenWindow(id: id, width: width, height: height,
+                                   titleMatches: titleMatchesExtension(title), popupSized: popupSized))
     }
-    if let named = fresh.first(where: { titleMatchesExtension($0.title) }) { return named }
-    let sized = fresh.filter(\.popupSized)
+    return windows
+}
+
+func encodeSeenWindows(_ windows: [SeenWindow]) -> String {
+    if windows.isEmpty { return "-" }
+    return windows.map { "\($0.id):\($0.width):\($0.height)" }.sorted().joined(separator: ",")
+}
+
+func parseSeenWindows(_ encoded: String) -> [CGWindowID: (Int, Int)] {
+    guard encoded != "-", !encoded.isEmpty else { return [:] }
+    var prior: [CGWindowID: (Int, Int)] = [:]
+    for part in encoded.split(separator: ",") {
+        let bits = part.split(separator: ":")
+        if bits.count == 3, let id = UInt32(bits[0]), let width = Int(bits[1]), let height = Int(bits[2]) {
+            prior[CGWindowID(id)] = (width, height)
+        } else if bits.count == 1, let id = UInt32(bits[0]) {
+            prior[CGWindowID(id)] = (0, 0)
+        }
+    }
+    return prior
+}
+
+/// A popup that showed up after the shortcut. A reused window counts when its
+/// size becomes popup-sized, or when its title is the extension's. Titles are
+/// not kept. Nil when several untitled candidates disagree.
+func appearedPopupWindow(of browser: pid_t, prior: [CGWindowID: (Int, Int)]) -> CGWindowID? {
+    var titled: [CGWindowID] = []
+    var sized: [CGWindowID] = []
+    for window in seenWindows(of: browser) {
+        let previous = prior[window.id]
+        let wasPopup = previous.map { isPopupFrame(CGSize(width: $0.0, height: $0.1)) } ?? false
+        let becamePopup = window.popupSized && (previous == nil || !wasPopup)
+        if becamePopup && window.titleMatches { titled.append(window.id) }
+        if becamePopup { sized.append(window.id) }
+    }
+    if let id = titled.first { return id }
     if sized.count == 1 { return sized[0] }
     return nil
 }
 
 func showsPINPage(_ app: AXUIElement) -> Bool {
-    axWindows(app).contains { isPopupSized($0) && isPairingPINPage($0) }
+    if axWindows(app).contains(where: { isPopupSized($0) && isPairingPINPage($0) }) { return true }
+    guard let focused = axElement(attribute(app, kAXFocusedUIElementAttribute)) else { return false }
+    var element: AXUIElement? = focused
+    for _ in 0..<8 {
+        guard let current = element else { break }
+        if isPopupSized(current) && isPairingPINPage(current) { return true }
+        if elementIdentifier(current).hasPrefix("PIN"),
+           elementIdentifier(current).dropFirst(3).allSatisfy({ $0.isASCII && $0.isNumber }) {
+            return true
+        }
+        element = axElement(attribute(current, kAXParentAttribute))
+    }
+    return false
 }
 
 /// Sends ⌘⇧\ to Ardia and returns. This run does not click the toolbar or the
@@ -570,10 +649,10 @@ func openICloudPasswordsExtension(_ application: NSRunningApplication) {
     }
     _ = waitFor(0.3) { application.isActive ? true : nil }
     trace("activated \(activated)")
-    let beforeWindows = windowIDs(ownedBy: application.processIdentifier)
+    let beforeWindows = encodeSeenWindows(seenWindows(of: application.processIdentifier))
     sendCommandShiftBackslash()
     trace("sent-keys true")
-    startExtensionKeyWatcher(pid: application.processIdentifier, previousWindowIDs: beforeWindows)
+    startExtensionKeyWatcher(pid: application.processIdentifier, previousWindows: beforeWindows)
     trace("watcher true")
     trace("toolbar false")
     trace("menu-bar false")
@@ -735,14 +814,22 @@ let extensionKeyMark: Int64 = 0x504B
 
 nonisolated(unsafe) var extensionTap: CFMachPort?
 nonisolated(unsafe) var extensionPID: pid_t = 0
-nonisolated(unsafe) var extensionPreviousWindows: Set<CGWindowID> = []
+nonisolated(unsafe) var extensionPrior: [CGWindowID: (Int, Int)] = [:]
 nonisolated(unsafe) var extensionPopupID: CGWindowID = 0
+nonisolated(unsafe) var extensionPickerUp = false
 nonisolated(unsafe) var extensionHandsOff = false
 nonisolated(unsafe) var extensionSelectionMoved = false
 nonisolated(unsafe) var extensionPosting = false
 nonisolated(unsafe) var extensionSwallowEnterUp = false
 nonisolated(unsafe) var extensionRewriting = false
-nonisolated(unsafe) var extensionPINChecked = Date.distantPast
+nonisolated(unsafe) var extensionFilled = false
+nonisolated(unsafe) var extensionDismissed = false
+nonisolated(unsafe) var extensionPageTyped = false
+nonisolated(unsafe) var extensionUsedFallbackEnter = false
+nonisolated(unsafe) var extensionRowCount = -1
+nonisolated(unsafe) var extensionRows: [AXUIElement] = []
+nonisolated(unsafe) var extensionSingleSince: Date?
+nonisolated(unsafe) var extensionStarted = Date()
 
 func isDigitKeyCode(_ keyCode: Int64) -> Bool {
     switch keyCode {
@@ -768,30 +855,247 @@ func postUnmodifiedKey(_ keyCode: CGKeyCode) {
     }
 }
 
-func extensionPopupStillOpen() -> Bool {
-    extensionPopupID != 0 && windowIDs(ownedBy: extensionPID).contains(extensionPopupID)
+func isRowFrame(_ frame: CGRect) -> Bool {
+    frame.height >= 28 && frame.height <= 88 && frame.width >= 100 && frame.width <= 520
 }
 
-func noteExtensionPINPage() {
-    guard !extensionHandsOff else { return }
+func isLargePage(_ element: AXUIElement) -> Bool {
+    guard elementRole(element) == "AXWebArea", let frame = elementFrame(element) else { return false }
+    return frame.width > 520 && !isPopupFrame(frame.size)
+}
+
+func findCredentialList(in root: AXUIElement, depth: Int, budget: inout Int) -> AXUIElement? {
+    if budget <= 0 || depth > 16 { return nil }
+    budget -= 1
+    if elementIdentifier(root) == "credentialList" { return root }
+    if isLargePage(root) { return nil }
+    for child in children(root) {
+        if let found = findCredentialList(in: child, depth: depth + 1, budget: &budget) { return found }
+    }
+    return nil
+}
+
+func extensionDocument(_ element: AXUIElement) -> Bool {
+    guard let document = attribute(element, kAXDocumentAttribute) as? String else { return false }
+    return document.contains("extension://\(iCloudPasswordsExtensionID)")
+}
+
+/// Direct children that are big enough to be a credential row. Labels inside
+/// a row are not counted, and nothing's text is read.
+func rowElements(of list: AXUIElement) -> [AXUIElement] {
+    let skip: Set<String> = ["AXButton", "AXScrollBar", "AXScrollArea", "AXImage", "AXCheckBox"]
+    let framed = children(list).filter { child in
+        if skip.contains(elementRole(child)) { return false }
+        if elementIdentifier(child).hasPrefix("PIN") { return false }
+        guard let frame = elementFrame(child) else { return false }
+        return isRowFrame(frame)
+    }
+    return framed.sorted { (elementFrame($0)?.minY ?? 0) < (elementFrame($1)?.minY ?? 0) }
+}
+
+func singleListRows(in root: AXUIElement) -> [AXUIElement]? {
+    var lists: [[AXUIElement]] = []
+    func walk(_ element: AXUIElement, depth: Int) {
+        if depth > 8 { return }
+        if isLargePage(element) { return }
+        let role = elementRole(element)
+        if role == kAXListRole as String || role == kAXOutlineRole as String || role == kAXTableRole as String {
+            lists.append(rowElements(of: element))
+            return
+        }
+        for child in children(element) { walk(child, depth: depth + 1) }
+    }
+    walk(root, depth: 0)
+    if lists.count == 1 { return lists[0] }
+    return nil
+}
+
+struct CredentialScan {
+    var rows: [AXUIElement] = []
+    var known = false
+}
+
+/// Nil-known means the extension UI was not visible to Accessibility, so the
+/// count must not be treated as zero. Row values are not read.
+func scanCredentialRows(in app: AXUIElement) -> CredentialScan {
+    var budget = 500
+    for window in axWindows(app) {
+        if let list = findCredentialList(in: window, depth: 0, budget: &budget) {
+            return CredentialScan(rows: rowElements(of: list), known: true)
+        }
+    }
+    if let focused = axElement(attribute(app, kAXFocusedUIElementAttribute)) {
+        var focusedBudget = 200
+        if let list = findCredentialList(in: focused, depth: 0, budget: &focusedBudget) {
+            return CredentialScan(rows: rowElements(of: list), known: true)
+        }
+        var element: AXUIElement? = focused
+        for _ in 0..<8 {
+            guard let current = element else { break }
+            if elementIdentifier(current) == "credentialList" {
+                return CredentialScan(rows: rowElements(of: current), known: true)
+            }
+            element = axElement(attribute(current, kAXParentAttribute))
+        }
+    }
+    for window in axWindows(app) where isPopupSized(window)
+        && (titleMatchesExtension(windowTitle(window)) || extensionDocument(window)) {
+        if let rows = singleListRows(in: window) {
+            return CredentialScan(rows: rows, known: true)
+        }
+    }
+    return CredentialScan()
+}
+
+func hasPressAction(_ element: AXUIElement) -> Bool {
+    var names: CFArray?
+    guard AXUIElementCopyActionNames(element, &names) == .success,
+          let names = names as? [String] else { return false }
+    return names.contains(kAXPressAction as String)
+}
+
+/// The extension fills a credential when its row is pressed or clicked.
+/// Buttons and PIN fields are never the target.
+func activateCredential(_ element: AXUIElement) -> Bool {
+    if elementIdentifier(element).hasPrefix("PIN") { return false }
+    if elementRole(element) == kAXButtonRole as String { return false }
+    if hasPressAction(element), AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
+        return true
+    }
+    guard let frame = elementFrame(element), isRowFrame(frame) else { return false }
+    click(at: CGPoint(x: frame.midX, y: frame.midY))
+    return true
+}
+
+func extensionApp() -> AXUIElement {
     let app = AXUIElementCreateApplication(extensionPID)
     AXUIElementSetMessagingTimeout(app, 0.12)
-    if showsPINPage(app) {
-        extensionHandsOff = true
-        trace("pin true")
+    return app
+}
+
+func frontIsExtensionBrowser() -> Bool {
+    guard let front = NSWorkspace.shared.frontmostApplication else { return false }
+    if front.processIdentifier == extensionPID { return true }
+    if let bundle = front.bundleIdentifier, bundle == ardiaBundleID || bundle.hasPrefix("com.ardia.") {
+        return true
+    }
+    return false
+}
+
+func focusedIsEditable() -> Bool {
+    guard let focused = axElement(attribute(extensionApp(), kAXFocusedUIElementAttribute)) else { return false }
+    switch elementRole(focused) {
+    case "AXTextField", "AXTextArea", "AXComboBox", "AXSearchField":
+        return true
+    default:
+        return false
     }
 }
 
-/// While the extension popup is open: unmodified Enter with no prior Up/Down
-/// becomes ArrowDown then Enter, so the first row is filled instead of the
-/// popup closing. After Up or Down, Enter reaches the extension unchanged.
-/// A pairing PIN page (or any digit key, which is how that page is used) is
-/// left completely alone. List text is never read.
-func watchExtensionPopup(pid: pid_t, previousWindowIDs: Set<CGWindowID>) -> Never {
+func isModifierKeyCode(_ keyCode: Int64) -> Bool {
+    switch keyCode {
+    case 54, 55, 56, 57, 58, 59, 60, 61, 62, 63: return true
+    default: return false
+    }
+}
+
+func extensionPopupStillOpen() -> Bool {
+    guard extensionPopupID != 0 else { return false }
+    return seenWindows(of: extensionPID).contains { $0.id == extensionPopupID }
+}
+
+func refreshExtensionPicker() {
+    if extensionHandsOff || extensionFilled { return }
+    let app = extensionApp()
+    if let id = appearedPopupWindow(of: extensionPID, prior: extensionPrior) {
+        if !extensionPickerUp { trace("popup true") }
+        extensionPopupID = id
+        extensionPickerUp = true
+    }
+    let scan = scanCredentialRows(in: app)
+    if scan.known && !scan.rows.isEmpty {
+        // A credential row is showing, so a 6-digit code on that screen is not
+        // the pairing PIN.
+        if extensionRowCount != scan.rows.count { trace("rows \(scan.rows.count)") }
+        extensionRows = scan.rows
+        extensionRowCount = scan.rows.count
+        extensionPickerUp = true
+        return
+    }
+    if showsPINPage(app) {
+        extensionHandsOff = true
+        extensionRows = []
+        extensionRowCount = -1
+        trace("pin true")
+        return
+    }
+    if scan.known {
+        if extensionRowCount != 0 { trace("rows 0") }
+        extensionRows = []
+        extensionRowCount = 0
+        extensionPickerUp = true
+    } else {
+        extensionRows = []
+        extensionRowCount = -1
+    }
+}
+
+func autofillSingleCredential() {
+    guard !extensionHandsOff, !extensionFilled, !extensionDismissed else { return }
+    guard extensionRowCount == 1, let row = extensionRows.first else {
+        extensionSingleSince = nil
+        return
+    }
+    if extensionSingleSince == nil {
+        extensionSingleSince = Date()
+        return
+    }
+    guard let since = extensionSingleSince, Date().timeIntervalSince(since) >= 0.5 else { return }
+    guard activateCredential(row) else { return }
+    extensionFilled = true
+    trace("autofill true")
+}
+
+/// Click the first row when Accessibility can see it. Otherwise ArrowDown
+/// then Enter: with nothing highlighted the extension would close on Enter,
+/// and ArrowDown highlights the first row so the following Enter fills it.
+func fillFromEnter() {
+    guard !extensionHandsOff, !extensionFilled else { return }
+    if extensionSelectionMoved {
+        extensionPosting = true
+        postUnmodifiedKey(36)
+        extensionPosting = false
+        trace("enter-current true")
+        return
+    }
+    if extensionRowCount >= 1, let row = extensionRows.first, activateCredential(row) {
+        extensionFilled = true
+        trace("enter-click true")
+        return
+    }
+    extensionPosting = true
+    postUnmodifiedKey(0x7D)
+    usleep(80_000)
+    guard !extensionHandsOff else {
+        extensionPosting = false
+        return
+    }
+    postUnmodifiedKey(36)
+    extensionPosting = false
+    trace(extensionPickerUp ? "enter-keys true" : "enter-fallback true")
+}
+
+/// One credential is activated as soon as the count is stably 1. Otherwise
+/// unmodified Enter fills the first row, or the highlighted row after Up/Down.
+/// Enter is not rewritten for the web page once the user has typed, pressed
+/// Esc, or the short fallback window has passed — unless the picker itself
+/// was actually seen. List text is never read. A PIN page is left alone.
+func watchExtensionPopup(pid: pid_t, previousWindows: String) -> Never {
     let lock = open(lastRunURL.path + ".extension.lock", O_CREAT | O_RDWR, 0o600)
     guard lock >= 0, flock(lock, LOCK_EX | LOCK_NB) == 0 else { exit(0) }
     extensionPID = pid
-    extensionPreviousWindows = previousWindowIDs
+    extensionPrior = parseSeenWindows(previousWindows)
+    extensionStarted = Date()
 
     let callback: CGEventTapCallBack = { _, type, event, _ in
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -808,81 +1112,80 @@ func watchExtensionPopup(pid: pid_t, previousWindowIDs: Set<CGWindowID>) -> Neve
             }
             return Unmanaged.passUnretained(event)
         }
-        guard extensionPopupID != 0,
-              NSWorkspace.shared.frontmostApplication?.processIdentifier == extensionPID else {
-            return Unmanaged.passUnretained(event)
-        }
-        if extensionHandsOff { return Unmanaged.passUnretained(event) }
-        if modifiers.isEmpty, isDigitKeyCode(keyCode) {
-            // A digit is how the PIN page is filled. Do not record which one.
-            extensionHandsOff = true
-            trace("digits true")
+        guard frontIsExtensionBrowser() else { return Unmanaged.passUnretained(event) }
+        if extensionHandsOff || extensionFilled { return Unmanaged.passUnretained(event) }
+        let plain = event.flags.intersection([.maskCommand, .maskAlternate, .maskControl]).isEmpty
+        if plain, isDigitKeyCode(keyCode) {
+            // A digit is how the PIN page is filled. Which digit is not recorded.
+            if extensionPickerUp {
+                extensionHandsOff = true
+                trace("digits true")
+            } else {
+                extensionPageTyped = true
+            }
             return Unmanaged.passUnretained(event)
         }
         if modifiers.isEmpty, keyCode == 0x7E || keyCode == 0x7D {
             extensionSelectionMoved = true
+            extensionPickerUp = true
             return Unmanaged.passUnretained(event)
+        }
+        if modifiers.isEmpty, keyCode == 53 {
+            extensionDismissed = true
+            return Unmanaged.passUnretained(event)
+        }
+        if plain, !isModifierKeyCode(keyCode), keyCode != 48, keyCode != 36, keyCode != 76,
+           keyCode != 0x7E, keyCode != 0x7D, keyCode != 53, !extensionPickerUp {
+            extensionPageTyped = true
         }
         guard modifiers.isEmpty, keyCode == 36 || keyCode == 76 else {
             return Unmanaged.passUnretained(event)
         }
         if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 || extensionRewriting { return nil }
+        if extensionDismissed { return Unmanaged.passUnretained(event) }
         if extensionSelectionMoved { return Unmanaged.passUnretained(event) }
-        noteExtensionPINPage()
-        if extensionHandsOff { return Unmanaged.passUnretained(event) }
+        if extensionRowCount < 1, showsPINPage(extensionApp()) {
+            extensionHandsOff = true
+            trace("pin true")
+            return Unmanaged.passUnretained(event)
+        }
+        if !extensionPickerUp {
+            if extensionPageTyped || extensionUsedFallbackEnter { return Unmanaged.passUnretained(event) }
+            if Date().timeIntervalSince(extensionStarted) > 12 { return Unmanaged.passUnretained(event) }
+            if focusedIsEditable() { return Unmanaged.passUnretained(event) }
+            extensionUsedFallbackEnter = true
+        }
         extensionSwallowEnterUp = true
         extensionRewriting = true
         DispatchQueue.main.async {
             defer { extensionRewriting = false }
-            guard extensionPopupStillOpen(), !extensionHandsOff else { return }
-            extensionPosting = true
-            if !extensionSelectionMoved {
-                postUnmodifiedKey(0x7D)
-                // The extension adds the highlight in its key handler. Enter
-                // before that runs would still see nothing selected and close.
-                usleep(80_000)
-            }
-            guard !extensionHandsOff else {
-                extensionPosting = false
-                return
-            }
-            let fillingFirst = !extensionSelectionMoved
-            postUnmodifiedKey(36)
-            extensionPosting = false
-            trace("enter-first \(fillingFirst)")
+            guard !extensionHandsOff, !extensionFilled else { return }
+            fillFromEnter()
         }
         return nil
     }
 
+    let mask = CGEventMask(1 << CGEventType.keyDown.rawValue) | CGEventMask(1 << CGEventType.keyUp.rawValue)
     let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
-                            eventsOfInterest: CGEventMask(1 << CGEventType.keyDown.rawValue)
-                                | CGEventMask(1 << CGEventType.keyUp.rawValue),
-                            callback: callback, userInfo: nil)
-    guard let tap else { exit(0) }
-    extensionTap = tap
-    CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
-    CGEvent.tapEnable(tap: tap, enable: true)
+                            eventsOfInterest: mask, callback: callback, userInfo: nil)
+        ?? CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap,
+                             eventsOfInterest: mask, callback: callback, userInfo: nil)
+    if let tap {
+        extensionTap = tap
+        CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+    } else {
+        trace("tap false")
+    }
 
-    let started = Date()
-    Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
-        if extensionPopupID == 0 {
-            if let found = newPopupWindow(ownedBy: extensionPID, newSince: extensionPreviousWindows) {
-                extensionPopupID = found.id
-                trace("popup true")
-                noteExtensionPINPage()
-                extensionPINChecked = Date()
-            } else if Date().timeIntervalSince(started) > 8 {
-                trace("popup false")
-                exit(0)
-            }
-            return
-        }
-        guard extensionPopupStillOpen() else { exit(0) }
-        if !extensionHandsOff, Date().timeIntervalSince(extensionPINChecked) > 0.4 {
-            extensionPINChecked = Date()
-            noteExtensionPINPage()
-        }
-        if Date().timeIntervalSince(started) > 30 * 60 { exit(0) }
+    Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { _ in
+        refreshExtensionPicker()
+        autofillSingleCredential()
+        if extensionFilled || extensionHandsOff || extensionDismissed { exit(0) }
+        if extensionPopupID != 0, !extensionPopupStillOpen() { exit(0) }
+        let age = Date().timeIntervalSince(extensionStarted)
+        if !extensionPickerUp && (extensionPageTyped || age > 12) { exit(0) }
+        if age > 90 { exit(0) }
     }
     RunLoop.main.run()
     exit(0)
@@ -906,10 +1209,10 @@ func startKeyWatcher() {
     posix_spawnattr_destroy(&attributes)
 }
 
-/// Same kind of detached watcher, for the Ardia extension popup only.
-/// `previousWindowIDs` were on screen before ⌘⇧\; the popup is a window that
-/// appears after that. Stdio is discarded so Raycast does not wait.
-func startExtensionKeyWatcher(pid browser: pid_t, previousWindowIDs: Set<CGWindowID>) {
+/// Detached watcher for the Ardia extension picker. `previousWindows` is the
+/// on-screen windows of Ardia and its helpers before ⌘⇧\. Stdio is discarded
+/// so Raycast does not wait.
+func startExtensionKeyWatcher(pid browser: pid_t, previousWindows: String) {
     guard let path = Bundle.main.executablePath ?? CommandLine.arguments.first else { return }
     var attributes: posix_spawnattr_t?
     posix_spawnattr_init(&attributes)
@@ -917,8 +1220,7 @@ func startExtensionKeyWatcher(pid browser: pid_t, previousWindowIDs: Set<CGWindo
     var files: posix_spawn_file_actions_t?
     posix_spawn_file_actions_init(&files)
     for fd: Int32 in 0...2 { posix_spawn_file_actions_addopen(&files, fd, "/dev/null", fd == 0 ? O_RDONLY : O_WRONLY, 0) }
-    let encoded = previousWindowIDs.map { String($0) }.sorted().joined(separator: ",")
-    var tokens = [path, "--extension-keys", String(browser), encoded.isEmpty ? "-" : encoded]
+    var tokens = [path, "--extension-keys", String(browser), previousWindows.isEmpty ? "-" : previousWindows]
     if traceEnabled { tokens.append("--trace") }
     var pid: pid_t = 0
     let argv = tokens.map { strdup($0) } + [nil]
@@ -950,13 +1252,8 @@ if command == "--keys" {
 if command == "--extension-keys" {
     let positional = args.filter { $0 != "--trace" }
     guard positional.count >= 2, let pid = pid_t(positional[1]), pid > 0 else { exit(1) }
-    let previous: Set<CGWindowID>
-    if positional.count >= 3, positional[2] != "-" {
-        previous = Set(positional[2].split(separator: ",").compactMap { UInt32($0) })
-    } else {
-        previous = []
-    }
-    watchExtensionPopup(pid: pid, previousWindowIDs: previous)
+    let encoded = positional.count >= 3 ? positional[2] : "-"
+    watchExtensionPopup(pid: pid, previousWindows: encoded)
 }
 
 let front = frontApplication()
