@@ -5,13 +5,12 @@
 // the user binds to "Activate the extension" for iCloud Passwords — then
 // stops. It does not also click the toolbar button (that button toggles) or
 // the Passwords menu bar in the same run. A detached watcher then handles the
-// picker. When Accessibility can see exactly one credential row, and it is
-// not the pairing PIN page, that row is activated once (the extension fills
-// it). Otherwise unmodified Enter fills the first row, unless Up or Down was
-// already used, in which case Enter is left alone and fills the highlighted
-// row. The picker is often not a new window of Ardia's own process, so Enter
-// is not gated on that. A pairing PIN page is not clicked and is not sent
-// keys. Row text is never read.
+// picker. Unmodified Enter fills the first row (a click when the row can be
+// seen, otherwise ArrowDown and then Enter). After Up or Down, Enter is left
+// alone and fills the highlighted row. The picker is often not a new window
+// of Ardia's own process, so Enter is not gated on that. Nothing is filled
+// until the user presses Enter. A pairing PIN page is not clicked and is not
+// sent keys. Row text is never read.
 //
 // Otherwise it clicks the Passwords menu bar icon
 // (com.apple.Passwords.MenuBarExtra) where Accessibility reports it and puts
@@ -828,7 +827,6 @@ nonisolated(unsafe) var extensionPageTyped = false
 nonisolated(unsafe) var extensionUsedFallbackEnter = false
 nonisolated(unsafe) var extensionRowCount = -1
 nonisolated(unsafe) var extensionRows: [AXUIElement] = []
-nonisolated(unsafe) var extensionSingleSince: Date?
 nonisolated(unsafe) var extensionStarted = Date()
 
 func isDigitKeyCode(_ keyCode: Int64) -> Bool {
@@ -1040,22 +1038,6 @@ func refreshExtensionPicker() {
     }
 }
 
-func autofillSingleCredential() {
-    guard !extensionHandsOff, !extensionFilled, !extensionDismissed else { return }
-    guard extensionRowCount == 1, let row = extensionRows.first else {
-        extensionSingleSince = nil
-        return
-    }
-    if extensionSingleSince == nil {
-        extensionSingleSince = Date()
-        return
-    }
-    guard let since = extensionSingleSince, Date().timeIntervalSince(since) >= 0.5 else { return }
-    guard activateCredential(row) else { return }
-    extensionFilled = true
-    trace("autofill true")
-}
-
 /// Click the first row when Accessibility can see it. Otherwise ArrowDown
 /// then Enter: with nothing highlighted the extension would close on Enter,
 /// and ArrowDown highlights the first row so the following Enter fills it.
@@ -1085,11 +1067,11 @@ func fillFromEnter() {
     trace(extensionPickerUp ? "enter-keys true" : "enter-fallback true")
 }
 
-/// One credential is activated as soon as the count is stably 1. Otherwise
-/// unmodified Enter fills the first row, or the highlighted row after Up/Down.
+/// Unmodified Enter fills the first row, or the highlighted row after Up/Down.
 /// Enter is not rewritten for the web page once the user has typed, pressed
 /// Esc, or the short fallback window has passed — unless the picker itself
-/// was actually seen. List text is never read. A PIN page is left alone.
+/// was actually seen. Nothing is submitted until that Enter. List text is
+/// never read. A PIN page is left alone.
 func watchExtensionPopup(pid: pid_t, previousWindows: String) -> Never {
     let lock = open(lastRunURL.path + ".extension.lock", O_CREAT | O_RDWR, 0o600)
     guard lock >= 0, flock(lock, LOCK_EX | LOCK_NB) == 0 else { exit(0) }
@@ -1180,7 +1162,6 @@ func watchExtensionPopup(pid: pid_t, previousWindows: String) -> Never {
 
     Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { _ in
         refreshExtensionPicker()
-        autofillSingleCredential()
         if extensionFilled || extensionHandsOff || extensionDismissed { exit(0) }
         if extensionPopupID != 0, !extensionPopupStillOpen() { exit(0) }
         let age = Date().timeIntervalSince(extensionStarted)
